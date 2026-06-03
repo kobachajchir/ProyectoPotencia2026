@@ -126,31 +126,31 @@
 // ---------------------------------------------------------------------------
 
 // Cruce por cero: D2 / PD2 / INT0.
-#define ZERO_CROSS_DDR                 DDRD
-#define ZERO_CROSS_PORT                PORTD
-#define ZERO_CROSS_PINREG              PIND
-#define ZERO_CROSS_BIT                 PD2
+#define ZERO_CROSS_DDR                 DDRD      // Registro de direccion del puerto D.
+#define ZERO_CROSS_PORT                PORTD     // Registro de salida/pull-up del puerto D.
+#define ZERO_CROSS_PINREG              PIND      // Registro de lectura instantanea del puerto D.
+#define ZERO_CROSS_BIT                 PD2       // Bit fisico asociado a D2 / INT0.
 #define ZERO_CROSS_USE_PULLUP          0
 #define ZERO_CROSS_RISING_EDGE         1
 
 // Salida de disparo: D8 / PB0.
-#define TRIAC_GATE_DDR                 DDRB
-#define TRIAC_GATE_PORT                PORTB
-#define TRIAC_GATE_BIT                 PB0
+#define TRIAC_GATE_DDR                 DDRB      // Registro de direccion del puerto B.
+#define TRIAC_GATE_PORT                PORTB     // Registro que gobierna el nivel logico del gate.
+#define TRIAC_GATE_BIT                 PB0       // Bit fisico asociado a D8 / PB0.
 
 // Llave digital ON/OFF: D4 / PD4, pull-up interno.
-#define ENABLE_SWITCH_DDR              DDRD
-#define ENABLE_SWITCH_PORT             PORTD
-#define ENABLE_SWITCH_PINREG           PIND
-#define ENABLE_SWITCH_BIT              PD4
+#define ENABLE_SWITCH_DDR              DDRD      // Direccion de la entrada de llave.
+#define ENABLE_SWITCH_PORT             PORTD     // Pull-up interno de la llave.
+#define ENABLE_SWITCH_PINREG           PIND      // Lectura directa de la llave.
+#define ENABLE_SWITCH_BIT              PD4       // Bit fisico asociado a D4 / PD4.
 #define ENABLE_SWITCH_ACTIVE_LOW       1
 #define ENABLE_SWITCH_DEBOUNCE_MS      40UL
 
 // Potenciometro de setpoint: A0 / PC0 / ADC0.
 #define POT_ADC_CHANNEL                0
-#define POT_ADC_DDR                    DDRC
-#define POT_ADC_PORT                   PORTC
-#define POT_ADC_BIT                    PC0
+#define POT_ADC_DDR                    DDRC      // Direccion del puerto analogico.
+#define POT_ADC_PORT                   PORTC     // Pull-up digital del pin analogico.
+#define POT_ADC_BIT                    PC0       // Bit fisico asociado a A0 / ADC0.
 
 // MAX6675. Los numeros digitales son los que usa la libreria.
 #define MAX6675_SCK_PIN                13
@@ -158,15 +158,15 @@
 #define MAX6675_SO_PIN                 12
 
 // Inicializacion directa para el pinout sugerido del MAX6675.
-#define MAX6675_SCK_DDR                DDRB
-#define MAX6675_SCK_PORT               PORTB
-#define MAX6675_SCK_BIT                PB5
-#define MAX6675_CS_DDR                 DDRB
-#define MAX6675_CS_PORT                PORTB
-#define MAX6675_CS_BIT                 PB2
-#define MAX6675_SO_DDR                 DDRB
-#define MAX6675_SO_PORT                PORTB
-#define MAX6675_SO_BIT                 PB4
+#define MAX6675_SCK_DDR                DDRB      // Direccion del reloj bit-bang del MAX6675.
+#define MAX6675_SCK_PORT               PORTB     // Nivel inicial del reloj bit-bang.
+#define MAX6675_SCK_BIT                PB5       // Bit fisico asociado a D13 / SCK.
+#define MAX6675_CS_DDR                 DDRB      // Direccion de chip-select del MAX6675.
+#define MAX6675_CS_PORT                PORTB     // Nivel de chip-select; alto es inactivo.
+#define MAX6675_CS_BIT                 PB2       // Bit fisico asociado a D10 / CS.
+#define MAX6675_SO_DDR                 DDRB      // Direccion de serial-out del MAX6675.
+#define MAX6675_SO_PORT                PORTB     // Pull-up digital de SO, dejado apagado.
+#define MAX6675_SO_BIT                 PB4       // Bit fisico asociado a D12 / MISO.
 
 // ---------------------------------------------------------------------------
 // Constantes derivadas de temporizacion
@@ -196,6 +196,41 @@
 #if (MAX_SAFE_DELAY_TICKS <= TRIAC_GATE_PULSE_TICKS)
 #error "No queda ventana temporal segura para el pulso de disparo."
 #endif
+
+/*
+  Guia rapida de asignaciones bitwise usadas en este firmware
+  -----------------------------------------------------------
+
+  En AVR, registros como DDRB, PORTB, EICRA, TIMSK1 o ADCSRA son bytes donde
+  cada bit controla una funcion del hardware. Por eso se modifican con mascaras
+  para tocar solo el bit necesario y conservar intactos los demas.
+
+  - (1 << BIT):
+    Desplaza el 1 hasta la posicion BIT. Si BIT=PB0, la mascara queda
+    00000001. Si BIT=PB5, queda 00100000.
+
+  - registro |= mascara:
+    Hace OR y asigna. Sirve para poner en 1 los bits de la mascara sin cambiar
+    los otros bits. Ejemplo: DDRB |= (1 << PB0) deja PB0 como salida y conserva
+    el estado previo de PB1..PB7.
+
+  - registro &= ~mascara:
+    Invierte la mascara con ~ y luego hace AND. Sirve para poner en 0 los bits
+    de la mascara sin cambiar los otros. Ejemplo: PORTB &= ~(1 << PB0) baja PB0
+    y conserva PB1..PB7.
+
+  - registro = mascara:
+    Es asignacion directa. Reemplaza todo el registro. Se usa solo cuando se
+    quiere definir un estado completo conocido, por ejemplo TCCR1A = 0.
+
+  - if (registro & mascara):
+    Hace AND para probar un bit. El resultado es distinto de cero si ese bit
+    esta en 1. Ejemplo: PIND & (1 << PD4) lee el nivel real del pin PD4.
+
+  - flags AVR como TIFR1 o EIFR:
+    En estos registros, escribir 1 no prende la bandera: la limpia. Por eso
+    TIFR1 = (1 << OCF1A) borra OCF1A. Es una regla especial de muchos flags AVR.
+*/
 
 // ---------------------------------------------------------------------------
 // Prototipos
@@ -348,15 +383,15 @@ void initPins(void)
     - PB5 / D13: salida SCK del MAX6675, queda en bajo.
     - PB4 / D12: entrada SO/MISO del MAX6675.
   */
-  TRIAC_GATE_DDR |= (uint8_t)(1 << TRIAC_GATE_BIT);
-  TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);
+  TRIAC_GATE_DDR |= (uint8_t)(1 << TRIAC_GATE_BIT);          // |= OR con mascara: pone PB0 en 1 como salida sin alterar otros bits de DDRB.
+  TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);        // &= con mascara invertida: pone PB0 en 0 y mantiene apagado el MOC3053.
 
-  MAX6675_CS_DDR |= (uint8_t)(1 << MAX6675_CS_BIT);
-  MAX6675_CS_PORT |= (uint8_t)(1 << MAX6675_CS_BIT);
-  MAX6675_SCK_DDR |= (uint8_t)(1 << MAX6675_SCK_BIT);
-  MAX6675_SCK_PORT &= (uint8_t)~(1 << MAX6675_SCK_BIT);
-  MAX6675_SO_DDR &= (uint8_t)~(1 << MAX6675_SO_BIT);
-  MAX6675_SO_PORT &= (uint8_t)~(1 << MAX6675_SO_BIT);
+  MAX6675_CS_DDR |= (uint8_t)(1 << MAX6675_CS_BIT);          // |= setea solo PB2 en DDRB: CS queda configurado como salida.
+  MAX6675_CS_PORT |= (uint8_t)(1 << MAX6675_CS_BIT);         // |= setea PB2 en PORTB: CS alto deselecciona el MAX6675.
+  MAX6675_SCK_DDR |= (uint8_t)(1 << MAX6675_SCK_BIT);        // |= setea solo PB5 en DDRB: SCK queda configurado como salida.
+  MAX6675_SCK_PORT &= (uint8_t)~(1 << MAX6675_SCK_BIT);      // &= ~mascara limpia PB5 en PORTB: SCK inicia en bajo.
+  MAX6675_SO_DDR &= (uint8_t)~(1 << MAX6675_SO_BIT);         // &= ~mascara limpia PB4 en DDRB: SO queda como entrada.
+  MAX6675_SO_PORT &= (uint8_t)~(1 << MAX6675_SO_BIT);        // &= ~mascara limpia PB4 en PORTB: pull-up digital apagado.
 
   /*
     DDRD/PORTD:
@@ -365,23 +400,23 @@ void initPins(void)
     - PD4: entrada de llave ON/OFF con pull-up interno. Con el cableado
       habitual, llave cerrada a GND significa ON.
   */
-  ZERO_CROSS_DDR &= (uint8_t)~(1 << ZERO_CROSS_BIT);
+  ZERO_CROSS_DDR &= (uint8_t)~(1 << ZERO_CROSS_BIT);         // &= ~mascara limpia PD2 en DDRD: INT0 queda como entrada.
 #if ZERO_CROSS_USE_PULLUP
-  ZERO_CROSS_PORT |= (uint8_t)(1 << ZERO_CROSS_BIT);
+  ZERO_CROSS_PORT |= (uint8_t)(1 << ZERO_CROSS_BIT);         // |= setea PD2 en PORTD: activa pull-up interno.
 #else
-  ZERO_CROSS_PORT &= (uint8_t)~(1 << ZERO_CROSS_BIT);
+  ZERO_CROSS_PORT &= (uint8_t)~(1 << ZERO_CROSS_BIT);        // &= ~mascara limpia PD2 en PORTD: desactiva pull-up.
 #endif
 
-  ENABLE_SWITCH_DDR &= (uint8_t)~(1 << ENABLE_SWITCH_BIT);
-  ENABLE_SWITCH_PORT |= (uint8_t)(1 << ENABLE_SWITCH_BIT);
+  ENABLE_SWITCH_DDR &= (uint8_t)~(1 << ENABLE_SWITCH_BIT);   // &= ~mascara limpia PD4 en DDRD: llave como entrada.
+  ENABLE_SWITCH_PORT |= (uint8_t)(1 << ENABLE_SWITCH_BIT);   // |= setea PD4 en PORTD: pull-up interno activo.
 
   /*
     DDRC/PORTC:
     - PC0 / ADC0 / A0: entrada analogica de potenciometro. El pull-up se deja
       apagado para no deformar el divisor resistivo.
   */
-  POT_ADC_DDR &= (uint8_t)~(1 << POT_ADC_BIT);
-  POT_ADC_PORT &= (uint8_t)~(1 << POT_ADC_BIT);
+  POT_ADC_DDR &= (uint8_t)~(1 << POT_ADC_BIT);               // &= ~mascara limpia PC0 en DDRC: A0 queda como entrada.
+  POT_ADC_PORT &= (uint8_t)~(1 << POT_ADC_BIT);              // &= ~mascara limpia PC0 en PORTC: sin pull-up sobre el potenciometro.
 }
 
 /*
@@ -398,7 +433,7 @@ void initExternalInterrupt(void)
   uint8_t oldSREG = SREG;
   cli();
 
-  EIMSK &= (uint8_t)~(1 << INT0);
+  EIMSK &= (uint8_t)~(1 << INT0);                            // &= ~mascara limpia INT0: deshabilita INT0 sin tocar otras interrupciones externas.
 
   /*
     EICRA:
@@ -406,15 +441,15 @@ void initExternalInterrupt(void)
     ISC01 ISC00 = 10: flanco descendente en INT0.
     Si el detector entrega pulsos invertidos, cambiar ZERO_CROSS_RISING_EDGE.
   */
-  EICRA &= (uint8_t)~((1 << ISC01) | (1 << ISC00));
+  EICRA &= (uint8_t)~((1 << ISC01) | (1 << ISC00));          // Primero crea mascara ISC01|ISC00, luego ~ la invierte y &= limpia solo esos bits.
 #if ZERO_CROSS_RISING_EDGE
-  EICRA |= (uint8_t)((1 << ISC01) | (1 << ISC00));
+  EICRA |= (uint8_t)((1 << ISC01) | (1 << ISC00));           // |= prende ISC01 e ISC00: INT0 por flanco ascendente.
 #else
-  EICRA |= (uint8_t)(1 << ISC01);
+  EICRA |= (uint8_t)(1 << ISC01);                            // |= prende solo ISC01; ISC00 quedo en 0: flanco descendente.
 #endif
 
-  EIFR = (uint8_t)(1 << INTF0);
-  EIMSK |= (uint8_t)(1 << INT0);
+  EIFR = (uint8_t)(1 << INTF0);                              // Asignacion directa al flag: en EIFR escribir 1 borra INTF0.
+  EIMSK |= (uint8_t)(1 << INT0);                             // |= prende INT0: habilita la interrupcion despues de configurar EICRA.
 
   SREG = oldSREG;
 }
@@ -441,37 +476,37 @@ void initTimer1(void)
     hardware, porque el gate usa D8/PB0 por acceso directo a PORTB.
     WGM11:0 = 00: parte baja del modo normal.
   */
-  TCCR1A = 0;
+  TCCR1A = 0;                                                // Asignacion directa: pone todos los bits de TCCR1A en 0.
 
   /*
     TCCR1B:
     WGM13:2 = 00: modo normal, TCNT1 cuenta hasta 0xFFFF.
     CS12:0 = 010: prescaler 8. A 16 MHz equivale a 2 MHz, 0.5 us por tick.
   */
-  TCCR1B = (uint8_t)(1 << CS11);
+  TCCR1B = (uint8_t)(1 << CS11);                             // Asignacion directa: solo CS11 queda en 1, seleccionando prescaler 8.
 
   /*
     TCNT1/OCR1A/OCR1B:
     TCNT1 se reinicia en cada cruce por cero. OCR1A se carga con el retardo de
     disparo del semiciclo y OCR1B con retardo + 100 us.
   */
-  TCNT1 = 0;
-  OCR1A = MAX_SAFE_DELAY_TICKS;
-  OCR1B = MAX_SAFE_DELAY_TICKS + TRIAC_GATE_PULSE_TICKS;
+  TCNT1 = 0;                                                 // Escribe 0 en el registro contador completo de 16 bits.
+  OCR1A = MAX_SAFE_DELAY_TICKS;                              // Asignacion de 16 bits: compare A recibe el retardo seguro inicial.
+  OCR1B = MAX_SAFE_DELAY_TICKS + TRIAC_GATE_PULSE_TICKS;     // Asignacion de 16 bits: compare B queda 100 us despues de OCR1A.
 
   /*
     TIMSK1:
     Las interrupciones de comparacion quedan apagadas por defecto. INT0 las
     habilita solo para el semiciclo actual, evitando redisparos.
   */
-  TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B) | (1 << TOIE1));
+  TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B) | (1 << TOIE1)); // &= ~mascara apaga OCIE1A/OCIE1B/TOIE1 sin tocar otros bits.
 
   /*
     TIFR1:
     En AVR las banderas se limpian escribiendo 1. Se eliminan compare flags y
     overflow flags viejas antes de empezar.
   */
-  TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B) | (1 << TOV1));
+  TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B) | (1 << TOV1));       // Flags AVR: asignar 1 a OCF1A/OCF1B/TOV1 los borra.
 
   SREG = oldSREG;
 }
@@ -492,7 +527,7 @@ void initADC(void)
     REFS0 = 1: referencia AVcc con capacitor externo en AREF.
     MUX3:0 = POT_ADC_CHANNEL: seleccion ADC0 por defecto.
   */
-  ADMUX = (uint8_t)((1 << REFS0) | (POT_ADC_CHANNEL & 0x0F));
+  ADMUX = (uint8_t)((1 << REFS0) | (POT_ADC_CHANNEL & 0x0F));          // (1<<REFS0) prende AVcc; channel&0x0F asegura solo MUX3:0.
 
   /*
     ADCSRA:
@@ -500,13 +535,13 @@ void initADC(void)
     ADPS2:0 = 111: prescaler 128.
     ADIE = 0: no se usa interrupcion ADC; el muestreo no es critico.
   */
-  ADCSRA = (uint8_t)((1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0));
+  ADCSRA = (uint8_t)((1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0)); // OR combina bits: ADEN=1 y ADPS2:0=111.
 
   /*
     DIDR0:
     Deshabilita el buffer digital de ADC0 para reducir consumo y ruido.
   */
-  DIDR0 |= (uint8_t)(1 << ADC0D);
+  DIDR0 |= (uint8_t)(1 << ADC0D);                                    // |= prende ADC0D: deshabilita el buffer digital de ADC0.
 }
 
 /*
@@ -572,10 +607,10 @@ float readSetpointPot(void)
 */
 uint16_t readADCBlocking(uint8_t channel)
 {
-  ADMUX = (uint8_t)((ADMUX & 0xF0) | (channel & 0x0F));
-  ADCSRA |= (uint8_t)(1 << ADSC);
+  ADMUX = (uint8_t)((ADMUX & 0xF0) | (channel & 0x0F));              // ADMUX&0xF0 conserva REFS/ADLAR; OR agrega el canal en MUX3:0.
+  ADCSRA |= (uint8_t)(1 << ADSC);                                    // |= prende ADSC sin cambiar ADEN/prescaler: inicia conversion.
 
-  while (ADCSRA & (1 << ADSC)) {
+  while (ADCSRA & (1 << ADSC)) {                                     // AND prueba ADSC: distinto de 0 significa conversion en curso.
     // Espera corta. Las interrupciones globales siguen habilitadas.
   }
 
@@ -878,11 +913,11 @@ void setOutputEnabledAtomic(bool enable)
     g_outputEnabled = enable;
 
     if (!enable) {
-      setTriacGateLow();
+      setTriacGateLow();                                             // Baja PB0 antes de desarmar comparadores.
       g_semicycleArmed = false;
       g_semicycleFired = false;
-      TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));
-      TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B));
+      TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));           // &= ~mascara limpia bits OCIE1A/OCIE1B: compare A/B quedan bloqueados.
+      TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B));                // Flags AVR: escribir 1 borra OCF1A y OCF1B.
     }
   }
 }
@@ -914,7 +949,7 @@ bool getOutputEnabledAtomic(void)
 */
 bool readEnableSwitchRawOn(void)
 {
-  bool pinIsHigh = (ENABLE_SWITCH_PINREG & (uint8_t)(1 << ENABLE_SWITCH_BIT)) != 0;
+  bool pinIsHigh = (ENABLE_SWITCH_PINREG & (uint8_t)(1 << ENABLE_SWITCH_BIT)) != 0; // AND con mascara aisla PD4; !=0 lo convierte a booleano.
 
 #if ENABLE_SWITCH_ACTIVE_LOW
   return !pinIsHigh;
@@ -929,11 +964,13 @@ bool readEnableSwitchRawOn(void)
   Activa el pin PB0/D8 escribiendo directamente en PORTB. Fisicamente enciende
   el LED de entrada del MOC3053 a traves de su resistencia serie, iniciando el
   disparo del TRIAC principal si hay corriente suficiente en la carga. Es una
-  operacion de tiempo constante, sin librerias y apta para ISR.
+  operacion de tiempo constante y sin librerias. Se conserva para codigo de
+  loop, pero las ISR escriben PORTB directamente para no llamar funciones desde
+  interrupciones.
 */
 static inline void setTriacGateHigh(void)
 {
-  TRIAC_GATE_PORT |= (uint8_t)(1 << TRIAC_GATE_BIT);
+  TRIAC_GATE_PORT |= (uint8_t)(1 << TRIAC_GATE_BIT);                 // |= OR con mascara: setea PB0 y conserva PB1..PB7.
 }
 
 /*
@@ -942,11 +979,13 @@ static inline void setTriacGateHigh(void)
   Desactiva PB0/D8 por acceso directo a PORTB. Fisicamente apaga el LED del
   MOC3053. El TRIAC de potencia seguira conduciendo hasta que su corriente caiga
   por debajo de la corriente de mantenimiento en el proximo cruce por cero; esta
-  funcion solo corta el pulso de gate. Es de tiempo constante y apta para ISR.
+  funcion solo corta el pulso de gate. Es de tiempo constante y sin librerias.
+  Se conserva para codigo de loop; las ISR hacen el acceso al puerto dentro del
+  propio vector.
 */
 static inline void setTriacGateLow(void)
 {
-  TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);
+  TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);                // &= AND con mascara invertida: limpia PB0 y conserva PB1..PB7.
 }
 
 /*
@@ -973,49 +1012,50 @@ static inline float clampFloat(float value, float low, float high)
   Sincroniza cada semiciclo con el cruce por cero. Filtra pulsos repetidos muy
   cercanos, reinicia TCNT1, programa OCR1A/OCR1B, limpia flags y habilita las
   comparaciones solo si el sistema esta autorizado. No lee sensores, no calcula
-  PID, no usa LCD y no llama librerias. El objetivo fisico es preparar un unico
-  disparo por semiciclo.
+  PID, no usa LCD, no llama librerias y no llama funciones auxiliares: todo el
+  acceso al gate queda escrito dentro del propio vector. El objetivo fisico es
+  preparar un unico disparo por semiciclo.
 */
 ISR(INT0_vect)
 {
-  uint16_t elapsedTicks = TCNT1;
+  uint16_t elapsedTicks = TCNT1;                                     // Lectura directa de 16 bits del contador Timer1.
+  bool acceptZeroCross =
+      (!g_zeroCrossSynchronized || (elapsedTicks >= ZERO_CROSS_BLANK_TICKS)); // Acepta solo si paso la ventana de blanking.
 
-  if (g_zeroCrossSynchronized && (elapsedTicks < ZERO_CROSS_BLANK_TICKS)) {
-    return;
+  if (acceptZeroCross) {
+    g_zeroCrossSynchronized = true;
+    g_zeroCrossCount++;
+
+    TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);              // &= ~mascara limpia PB0: corta inmediatamente el gate.
+
+    TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));             // &= ~mascara limpia OCIE1A/OCIE1B antes de reprogramar OCR.
+    TCNT1 = 0;                                                       // Asignacion directa: contador de Timer1 vuelve a cero.
+    TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B) | (1 << TOV1));    // Flags AVR: escribir 1 borra compare/overflow pendientes.
+
+    if (!g_outputEnabled) {
+      g_semicycleArmed = false;
+      g_semicycleFired = false;
+      g_blockedPulseCount++;
+    } else {
+      uint16_t delayTicks = g_firingDelayTicks;
+
+      if (delayTicks < MIN_FIRING_DELAY_TICKS) {
+        delayTicks = MIN_FIRING_DELAY_TICKS;
+      }
+
+      if (delayTicks > MAX_SAFE_DELAY_TICKS) {
+        delayTicks = MAX_SAFE_DELAY_TICKS;
+      }
+
+      OCR1A = delayTicks;                                            // Asignacion directa: OCR1A fija el instante de inicio de pulso.
+      OCR1B = delayTicks + TRIAC_GATE_PULSE_TICKS;                   // Asignacion directa: OCR1B fija el corte 100 us despues.
+
+      g_semicycleArmed = true;
+      g_semicycleFired = false;
+
+      TIMSK1 |= (uint8_t)((1 << OCIE1A) | (1 << OCIE1B));            // |= prende OCIE1A y OCIE1B: arma ambos compare del semiciclo.
+    }
   }
-
-  g_zeroCrossSynchronized = true;
-  g_zeroCrossCount++;
-  setTriacGateLow();
-
-  TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));
-  TCNT1 = 0;
-  TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B) | (1 << TOV1));
-
-  if (!g_outputEnabled) {
-    g_semicycleArmed = false;
-    g_semicycleFired = false;
-    g_blockedPulseCount++;
-    return;
-  }
-
-  uint16_t delayTicks = g_firingDelayTicks;
-
-  if (delayTicks < MIN_FIRING_DELAY_TICKS) {
-    delayTicks = MIN_FIRING_DELAY_TICKS;
-  }
-
-  if (delayTicks > MAX_SAFE_DELAY_TICKS) {
-    delayTicks = MAX_SAFE_DELAY_TICKS;
-  }
-
-  OCR1A = delayTicks;
-  OCR1B = delayTicks + TRIAC_GATE_PULSE_TICKS;
-
-  g_semicycleArmed = true;
-  g_semicycleFired = false;
-
-  TIMSK1 |= (uint8_t)((1 << OCIE1A) | (1 << OCIE1B));
 }
 
 /*
@@ -1024,18 +1064,19 @@ ISR(INT0_vect)
   Marca el instante de disparo. Si el semiciclo esta armado y la salida sigue
   habilitada, sube PB0 para encender el MOC3053. Deshabilita OCIE1A para impedir
   cualquier repeticion dentro del mismo semiciclo y deja OCIE1B encargado de
-  cortar el pulso 100 us despues. No ejecuta calculos pesados ni librerias.
+  cortar el pulso 100 us despues. No ejecuta calculos pesados, no llama
+  librerias y no llama funciones auxiliares.
 */
 ISR(TIMER1_COMPA_vect)
 {
-  TIMSK1 &= (uint8_t)~(1 << OCIE1A);
+  TIMSK1 &= (uint8_t)~(1 << OCIE1A);                                 // &= ~mascara limpia OCIE1A: compare A no puede repetirse.
 
   if (g_outputEnabled && g_semicycleArmed && !g_semicycleFired) {
-    setTriacGateHigh();
+    TRIAC_GATE_PORT |= (uint8_t)(1 << TRIAC_GATE_BIT);               // |= OR con mascara: sube PB0 y enciende LED del MOC3053.
     g_semicycleFired = true;
     g_firedPulseCount++;
   } else {
-    setTriacGateLow();
+    TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);              // &= ~mascara: baja PB0 aunque los demas bits de PORTB sigan intactos.
   }
 }
 
@@ -1044,13 +1085,13 @@ ISR(TIMER1_COMPA_vect)
 
   Finaliza el pulso de gate. Baja PB0, apaga las comparaciones de Timer1 y deja
   el semiciclo desarmado hasta el proximo INT0. Esto garantiza un solo pulso por
-  semiciclo. No lee sensores, no actualiza display y no usa llamadas
-  bloqueantes.
+  semiciclo. No lee sensores, no actualiza display, no usa llamadas bloqueantes
+  y no llama funciones auxiliares.
 */
 ISR(TIMER1_COMPB_vect)
 {
-  setTriacGateLow();
-  TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));
-  TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B));
+  TRIAC_GATE_PORT &= (uint8_t)~(1 << TRIAC_GATE_BIT);                // &= ~mascara limpia PB0: termina el pulso de gate.
+  TIMSK1 &= (uint8_t)~((1 << OCIE1A) | (1 << OCIE1B));               // &= ~mascara apaga OCIE1A/OCIE1B hasta el siguiente cruce.
+  TIFR1 = (uint8_t)((1 << OCF1A) | (1 << OCF1B));                    // Flags AVR: escribir 1 borra banderas de compare consumidas.
   g_semicycleArmed = false;
 }
