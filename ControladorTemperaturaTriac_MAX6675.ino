@@ -39,6 +39,12 @@
      durante tiempos largos. El codigo evita llamarlas desde ISR y actualiza el
      LCD con baja frecuencia para reducir jitter residual.
 
+  8. BRINGUP_IO_TEST_MODE permite probar entradas y salidas antes de conectar
+     potencia. En ese modo el LCD muestra temperatura, setpoint del pote,
+     angulo de prueba, estado ON/OFF y contador de cruces por cero. La llave
+     habilita los pulsos en D8 y el pote mueve el retardo de disparo, aun si el
+     sensor aparece como T:ERR. Para el control termico final, ponerlo en 0.
+
   Librerias usadas
   ----------------
   - LiquidCrystal_I2C para LCD 16x2.
@@ -72,6 +78,73 @@
     comparador hardware OC1A/OC1B en un pin compatible.
   - Timer1 queda reservado para el control de fase. No usar Servo, tone ni PWM
     dependiente de Timer1 en D9/D10 mientras este firmware este activo.
+
+  Plan recomendado de pruebas de banco, sin potencia conectada
+  ------------------------------------------------------------
+  1. Prueba visual y alimentacion:
+     Alimentar solo el Arduino, LCD, MAX6675, potenciometro y llave. No conectar
+     red electrica, TRIAC, plancha ni etapa de potencia. Verificar 5 V, GND
+     comun, ausencia de calentamiento y polaridad del LCD/I2C.
+
+  2. Prueba de LCD:
+     Cargar el sketch con BRINGUP_IO_TEST_MODE = 1. El LCD debe mostrar
+     temperatura actual o T:ERR, setpoint, angulo, contador Z y estado ON/OFF.
+     Si no muestra nada, probar direccion LCD_I2C_ADDRESS 0x27 o 0x3F y ajustar
+     contraste del backpack.
+
+  3. Prueba de potenciometro:
+     Girar el pote en A0. La linea superior debe cambiar S: objetivo. En modo
+     prueba tambien debe cambiar A: angulo. Esto confirma ADC, referencia AVcc,
+     divisor del pote y conversion de setpoint.
+
+  4. Prueba de llave:
+     Con pull-up interno, D4 abierto debe leerse OFF y D4 a GND debe leerse ON.
+     El LCD debe cambiar ON/OFF sin bloquear temperatura ni setpoint. Al pasar a
+     OFF, D8 debe ir inmediatamente a 0 y no deben salir nuevos pulsos.
+
+  5. Prueba del MAX6675:
+     Con termocupla conectada, el LCD debe mostrar T: valor en Celsius. Si
+     aparece T:ERR, revisar SCK D13, CS D10, SO D12, alimentacion del modulo y
+     polaridad de la termocupla. En modo prueba T:ERR no bloquea los pulsos para
+     poder validar D2/D8 antes de resolver el sensor.
+
+  6. Prueba de cruce por cero simulado por el propio Arduino:
+     Dejar SIMULATED_ZERO_CROSS_OUTPUT_ENABLE = 1. El pin D7/PD7 genera una
+     salida logica simulada con millis(). Conectar D7 a D2/INT0 usando una
+     resistencia serie de 1 k a 4.7 k. El contador ZC del LCD debe incrementar
+     y en D8 debe aparecer el pulso de disparo. Esta senal sirve para banco, no
+     es una referencia precisa de frecuencia.
+
+  7. Prueba de cruce por cero con generador externo:
+     Si se usa generador de funciones u otro microcontrolador aislado de la red,
+     aplicar a D2 una onda logica 0-5 V, con GND comun con Arduino y resistencia
+     serie de 1 k a 4.7 k. Para MAINS_FREQ_HZ=50 usar 100 Hz; para 60 Hz usar
+     120 Hz. No aplicar 12 V, 24 V, tension negativa ni red al pin D2.
+
+  8. Prueba de salida de disparo:
+     Con osciloscopio, CH1 en D2 y CH2 en D8, ambos referidos a GND Arduino.
+     Usar trigger en flanco de D2. Con llave ON se debe ver en D8 un pulso
+     positivo de aproximadamente 100 us por cruce aceptado. Al mover el pote,
+     el retardo entre D2 y D8 debe cambiar. Con llave OFF no debe haber pulsos.
+
+  9. Prueba del optotriac sin red:
+     Solo despues de validar D8, conectar el LED de entrada del MOC3053 con su
+     resistencia serie correcta y seguir midiendo del lado logico. Confirmar que
+     el pin AVR no exceda corriente segura y que la resistencia asegure la IFT
+     requerida por el MOC3053. Aun no conectar MT1/MT2 ni carga de potencia.
+
+  10. Prueba de detector real de cruce, todavia sin TRIAC/carga:
+     Con el detector de cruce aislado y alimentado correctamente, medir primero
+     su salida con osciloscopio. Debe entregar niveles compatibles 0-5 V al pin
+     D2. Luego conectar a D2 y verificar que Z incremente estable y que el pulso
+     de D8 quede sincronizado. Si hay doble conteo o ruido, ajustar el detector,
+     flanco o ZERO_CROSS_BLANK_US.
+
+  11. Paso a potencia:
+      Recien despues de que LCD, sensor, pote, llave, cruce y pulsos esten
+      verificados, conectar etapa de potencia con carga pequena resistiva,
+      fusible, aislamiento, disipador y osciloscopio. La plancha de 1800 W debe
+      ser la ultima prueba, no la primera.
 */
 
 #include <Arduino.h>
@@ -79,6 +152,7 @@
 #include <Wire.h>
 #include <max6675.h>
 #include <math.h>
+#include <stdio.h>
 #include <util/atomic.h>
 
 // ---------------------------------------------------------------------------
@@ -94,6 +168,10 @@
 #define TRIAC_GATE_PULSE_US            100UL
 #define HALF_CYCLE_GUARD_US            150UL
 #define ZERO_CROSS_BLANK_US            1000UL
+
+#define BRINGUP_IO_TEST_MODE           1       // 1=modo prueba: LCD/sensor/pote/llave/ZC/pulsos; 0=control PID final.
+#define SIMULATED_ZERO_CROSS_OUTPUT_ENABLE 1   // 1=genera cruce simulado en D7 para puentear a D2; 0=deshabilitado.
+#define SIMULATED_ZERO_CROSS_PULSE_MS  2UL     // Ancho del pulso alto simulado. Con millis(), 1..2 ms es practico.
 
 #define CONTROL_INTERVAL_MS            250UL
 #define CONTROL_SAMPLE_TIME_SEC        0.250f
@@ -117,9 +195,6 @@
 #define LCD_COLUMNS                    16
 #define LCD_ROWS                       2
 #define LCD_I2C_CLOCK_HZ               400000UL
-#define LCD_TEMP_DELTA_C               0.5f
-#define LCD_SETPOINT_DELTA_C           1.0f
-#define LCD_ANGLE_DELTA_DEG            1.0f
 
 // ---------------------------------------------------------------------------
 // Pinout configurable
@@ -132,6 +207,11 @@
 #define ZERO_CROSS_BIT                 PD2       // Bit fisico asociado a D2 / INT0.
 #define ZERO_CROSS_USE_PULLUP          0
 #define ZERO_CROSS_RISING_EDGE         1
+
+// Salida simulada de cruce por cero: D7 / PD7. Puente externo D7 -> D2.
+#define SIM_ZERO_CROSS_DDR             DDRD      // Registro de direccion del puerto D.
+#define SIM_ZERO_CROSS_PORT            PORTD     // Registro que gobierna el nivel logico de D7.
+#define SIM_ZERO_CROSS_BIT             PD7       // Bit fisico asociado a D7 / PD7.
 
 // Salida de disparo: D8 / PB0.
 #define TRIAC_GATE_DDR                 DDRB      // Registro de direccion del puerto B.
@@ -184,6 +264,7 @@
 #define MIN_FIRING_DELAY_TICKS         ((uint16_t)((FIRING_ANGLE_MIN_DEG / 180.0f) * (float)HALF_CYCLE_TICKS))
 #define MAX_SAFE_DELAY_TICKS           (HALF_CYCLE_TICKS - TRIAC_GATE_PULSE_TICKS - HALF_CYCLE_GUARD_TICKS)
 #define ZERO_CROSS_BLANK_TICKS         (ZERO_CROSS_BLANK_US * TIMER1_TICKS_PER_US)
+#define SIMULATED_ZERO_CROSS_PERIOD_MS (1000UL / (2UL * MAINS_FREQ_HZ))
 
 #if (TIMER1_TICKS_PER_US != 2UL)
 #warning "Este sketch esta ajustado para F_CPU=16MHz y prescaler 8: 0.5 us/tick."
@@ -195,6 +276,10 @@
 
 #if (MAX_SAFE_DELAY_TICKS <= TRIAC_GATE_PULSE_TICKS)
 #error "No queda ventana temporal segura para el pulso de disparo."
+#endif
+
+#if (SIMULATED_ZERO_CROSS_PULSE_MS >= SIMULATED_ZERO_CROSS_PERIOD_MS)
+#error "SIMULATED_ZERO_CROSS_PULSE_MS debe ser menor que SIMULATED_ZERO_CROSS_PERIOD_MS."
 #endif
 
 /*
@@ -257,6 +342,7 @@ uint16_t angleToTimerTicks(float angleDeg);
 void updateControlTask(void);
 void updateLCDTask(void);
 void readEnableSwitchTask(void);
+void updateSimulatedZeroCrossTask(void);
 void setOutputEnabledAtomic(bool enable);
 bool getOutputEnabledAtomic(void);
 bool readEnableSwitchRawOn(void);
@@ -303,12 +389,9 @@ uint32_t g_enableSwitchLastChangeMs = 0;
 uint32_t g_lastControlMs = 0;
 uint32_t g_lastLCDMs = 0;
 uint32_t g_max6675ReadyMs = MAX6675_STARTUP_MS;
-
-float g_lcdLastTempC = NAN;
-float g_lcdLastSetpointC = NAN;
-float g_lcdLastAngleDeg = NAN;
-bool g_lcdLastOutputEnabled = false;
-bool g_lcdLastSensorFault = true;
+uint32_t g_simZeroCrossNextPulseMs = 0;
+uint32_t g_simZeroCrossPulseEndMs = 0;
+bool g_simZeroCrossPulseActive = false;
 
 /*
   initVariant()
@@ -344,6 +427,9 @@ void setup(void)
 
   g_enableSwitchLastRawOn = readEnableSwitchRawOn();
   g_enableSwitchStableOn = g_enableSwitchLastRawOn;
+  g_simZeroCrossNextPulseMs = millis();
+  g_simZeroCrossPulseEndMs = millis();
+  g_simZeroCrossPulseActive = false;
   setOutputEnabledAtomic(false);
 }
 
@@ -359,6 +445,7 @@ void setup(void)
 void loop(void)
 {
   readEnableSwitchTask();
+  updateSimulatedZeroCrossTask();
   updateControlTask();
   updateLCDTask();
 }
@@ -405,6 +492,14 @@ void initPins(void)
   ZERO_CROSS_PORT |= (uint8_t)(1 << ZERO_CROSS_BIT);         // |= setea PD2 en PORTD: activa pull-up interno.
 #else
   ZERO_CROSS_PORT &= (uint8_t)~(1 << ZERO_CROSS_BIT);        // &= ~mascara limpia PD2 en PORTD: desactiva pull-up.
+#endif
+
+#if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
+  SIM_ZERO_CROSS_DDR |= (uint8_t)(1 << SIM_ZERO_CROSS_BIT);   // |= setea PD7 en DDRD: D7 queda como salida simulada.
+  SIM_ZERO_CROSS_PORT &= (uint8_t)~(1 << SIM_ZERO_CROSS_BIT); // &= ~mascara limpia PD7: pulso simulado inicia en bajo.
+#else
+  SIM_ZERO_CROSS_DDR &= (uint8_t)~(1 << SIM_ZERO_CROSS_BIT);  // &= ~mascara limpia PD7: deja D7 libre como entrada.
+  SIM_ZERO_CROSS_PORT &= (uint8_t)~(1 << SIM_ZERO_CROSS_BIT); // &= ~mascara limpia PD7: pull-up apagado si el modo esta deshabilitado.
 #endif
 
   ENABLE_SWITCH_DDR &= (uint8_t)~(1 << ENABLE_SWITCH_BIT);   // &= ~mascara limpia PD4 en DDRD: llave como entrada.
@@ -757,8 +852,11 @@ uint16_t angleToTimerTicks(float angleDeg)
   Se ejecuta cada CONTROL_INTERVAL_MS. Lee setpoint y temperatura, valida falla
   de termocupla, calcula el PID, transforma potencia a angulo y publica el
   retardo de disparo en ticks para las ISR. La publicacion de la variable de 16
-  bits se hace con ATOMIC_BLOCK. Si el sensor falla, fuerza potencia cero y
-  deshabilita inmediatamente la salida del TRIAC. No debe llamarse desde ISR.
+  bits se hace con ATOMIC_BLOCK. En modo final, si el sensor falla, fuerza
+  potencia cero y deshabilita inmediatamente la salida del TRIAC. En
+  BRINGUP_IO_TEST_MODE, el pote controla una potencia/angulo de prueba y la
+  llave permite emitir pulsos aunque la termocupla no este lista, para validar
+  D2/D8 con osciloscopio sin conectar potencia. No debe llamarse desde ISR.
 */
 void updateControlTask(void)
 {
@@ -774,6 +872,23 @@ void updateControlTask(void)
   if (isnan(newTemperatureC)) {
     g_sensorFault = true;
     g_temperatureC = NAN;
+
+#if BRINGUP_IO_TEST_MODE
+    g_pidIntegralTerm = 0.0f;
+    g_pidHasLastError = false;
+
+    float normalizedPot = (g_setpointC - SETPOINT_MIN_C) / (SETPOINT_MAX_C - SETPOINT_MIN_C);
+    g_powerPct = clampFloat(normalizedPot * 100.0f, 0.0f, 100.0f);
+    g_angleDeg = powerToFiringAngle(g_powerPct);
+
+    uint16_t testDelayTicks = angleToTimerTicks(g_angleDeg);
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+      g_firingDelayTicks = testDelayTicks;
+    }
+
+    setOutputEnabledAtomic(g_enableSwitchStableOn);
+    return;
+#else
     g_powerPct = 0.0f;
     g_angleDeg = FIRING_ANGLE_MAX_DEG;
     g_pidIntegralTerm = 0.0f;
@@ -785,12 +900,24 @@ void updateControlTask(void)
     }
     setOutputEnabledAtomic(false);
     return;
+#endif
   }
 
   g_sensorFault = false;
   g_temperatureC = newTemperatureC;
+
+#if BRINGUP_IO_TEST_MODE
+  g_pidIntegralTerm = 0.0f;
+  g_pidHasLastError = false;
+
+  float normalizedPot = (g_setpointC - SETPOINT_MIN_C) / (SETPOINT_MAX_C - SETPOINT_MIN_C);
+  g_powerPct = clampFloat(normalizedPot * 100.0f, 0.0f, 100.0f);
+  g_angleDeg = powerToFiringAngle(g_powerPct);
+#else
   g_powerPct = computePID(g_setpointC, g_temperatureC);
   g_angleDeg = powerToFiringAngle(g_powerPct);
+#endif
+
   uint16_t nextDelayTicks = angleToTimerTicks(g_angleDeg);
 
   ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
@@ -803,66 +930,94 @@ void updateControlTask(void)
 /*
   updateLCDTask()
 
-  Actualiza el LCD solo si hubo cambios significativos de temperatura,
-  setpoint, angulo/estado o si paso LCD_MAX_INTERVAL_MS. Usa LiquidCrystal_I2C,
-  por lo tanto es bloqueante y nunca debe ejecutarse dentro de una ISR. El
-  refresco es intencionalmente lento para no llenar el bus I2C de trafico
-  innecesario; el control por fase permanece en Timer1.
+  Actualiza el LCD una vez por segundo, sin umbrales de cambio significativo.
+  Usa snprintf() para construir textos del tipo ATRIBUTO:VALOR en buffers
+  estaticos de 16 caracteres. Como el LCD es 16x2, los valores rotan por
+  pantallas: temperatura actual/objetivo, angulo/contador ZC y, si esta
+  habilitado, estado del simulador de cruce. La esquina superior derecha queda
+  reservada para ON/OFF segun la llave debounced D4. Usa LiquidCrystal_I2C, por lo tanto es
+  bloqueante y nunca debe ejecutarse dentro de una ISR.
 */
 void updateLCDTask(void)
 {
   uint32_t now = millis();
-  bool outputEnabled = getOutputEnabledAtomic();
-
-  bool forceByTime = ((uint32_t)(now - g_lastLCDMs) >= LCD_MAX_INTERVAL_MS);
-  bool tempChanged =
-      isnan(g_lcdLastTempC) ||
-      isnan(g_temperatureC) ||
-      (fabs(g_temperatureC - g_lcdLastTempC) >= LCD_TEMP_DELTA_C);
-  bool setpointChanged =
-      isnan(g_lcdLastSetpointC) ||
-      (fabs(g_setpointC - g_lcdLastSetpointC) >= LCD_SETPOINT_DELTA_C);
-  bool angleChanged =
-      isnan(g_lcdLastAngleDeg) ||
-      (fabs(g_angleDeg - g_lcdLastAngleDeg) >= LCD_ANGLE_DELTA_DEG);
-  bool stateChanged =
-      (outputEnabled != g_lcdLastOutputEnabled) ||
-      (g_sensorFault != g_lcdLastSensorFault);
-
-  if (!forceByTime && !tempChanged && !setpointChanged && !angleChanged && !stateChanged) {
+  if ((uint32_t)(now - g_lastLCDMs) < LCD_MAX_INTERVAL_MS) {
     return;
   }
-
   g_lastLCDMs = now;
-  g_lcdLastTempC = g_temperatureC;
-  g_lcdLastSetpointC = g_setpointC;
-  g_lcdLastAngleDeg = g_angleDeg;
-  g_lcdLastOutputEnabled = outputEnabled;
-  g_lcdLastSensorFault = g_sensorFault;
+
+  bool switchEnabled = g_enableSwitchStableOn;
+  uint32_t zeroCrossCountSnapshot = 0;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    zeroCrossCountSnapshot = g_zeroCrossCount;
+  }
+
+  static uint8_t lcdPage = 0;
+  const uint8_t lcdPageCount =
+#if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
+      3;
+#else
+      2;
+#endif
+
+  if (lcdPage >= lcdPageCount) {
+    lcdPage = 0;
+  }
+
+  char topAttribute[14];
+  char bottomAttribute[17];
+  char topLine[17];
+  char bottomLine[17];
+  const char *stateText = switchEnabled ? "ON " : "OFF";
+
+  int tempActualInt = 0;
+  if (!g_sensorFault && !isnan(g_temperatureC)) {
+    tempActualInt = (int)(g_temperatureC + (g_temperatureC >= 0.0f ? 0.5f : -0.5f));
+  }
+
+  int tempObjetivoInt = (int)(g_setpointC + 0.5f);
+  int angleDisplay = (int)(g_angleDeg + 0.5f);
+  uint16_t zeroCrossDisplay = (uint16_t)(zeroCrossCountSnapshot % 10000UL);
+
+  switch (lcdPage) {
+    case 0:
+      if (g_sensorFault || isnan(g_temperatureC)) {
+        snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT: ERR");
+      } else {
+        snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT:%4d", tempActualInt);
+      }
+      snprintf(bottomAttribute, sizeof(bottomAttribute), "TEMP OBJ:%4d", tempObjetivoInt);
+      break;
+
+    case 1:
+      snprintf(topAttribute, sizeof(topAttribute), "ANG DISP:%4d", angleDisplay);
+      snprintf(bottomAttribute, sizeof(bottomAttribute), "ZC CNT:%5u", zeroCrossDisplay);
+      break;
+
+    default:
+#if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
+      snprintf(topAttribute, sizeof(topAttribute), "SIM ZC: ON");
+      snprintf(bottomAttribute, sizeof(bottomAttribute), "PER:%2lums W:%lums",
+               (unsigned long)SIMULATED_ZERO_CROSS_PERIOD_MS,
+               (unsigned long)SIMULATED_ZERO_CROSS_PULSE_MS);
+#else
+      snprintf(topAttribute, sizeof(topAttribute), "SIM ZC:OFF");
+      snprintf(bottomAttribute, sizeof(bottomAttribute), "PUENTE:NO");
+#endif
+      break;
+  }
+
+  snprintf(topLine, sizeof(topLine), "%-13.13s%s", topAttribute, stateText);
+  snprintf(bottomLine, sizeof(bottomLine), "%-16.16s", bottomAttribute);
 
   lcd.setCursor(0, 0);
-  if (g_sensorFault) {
-    lcd.print(F("T:ERR "));
-  } else {
-    lcd.print(F("T:"));
-    lcd.print(g_temperatureC, 1);
-    lcd.print(F(" "));
-  }
-  lcd.print(F("S:"));
-  lcd.print(g_setpointC, 0);
-  lcd.print(F("   "));
-
+  lcd.print(topLine);
   lcd.setCursor(0, 1);
-  lcd.print(F("A:"));
-  lcd.print((int)(g_angleDeg + 0.5f));
-  lcd.print(F(" P:"));
-  lcd.print((int)(g_powerPct + 0.5f));
-  lcd.print(F("%"));
+  lcd.print(bottomLine);
 
-  if (outputEnabled) {
-    lcd.print(F(" ON "));
-  } else {
-    lcd.print(F(" OFF"));
+  lcdPage++;
+  if (lcdPage >= lcdPageCount) {
+    lcdPage = 0;
   }
 }
 
@@ -893,9 +1048,52 @@ void readEnableSwitchTask(void)
         setOutputEnabledAtomic(false);
       } else if (!g_sensorFault) {
         setOutputEnabledAtomic(true);
+#if BRINGUP_IO_TEST_MODE
+      } else {
+        setOutputEnabledAtomic(true);
+#endif
       }
     }
   }
+}
+
+/*
+  updateSimulatedZeroCrossTask()
+
+  Genera una senal de banco en D7/PD7 para simular cruces por cero sin usar
+  red electrica ni detector externo. La salida produce un pulso alto cada
+  semiciclo teorico calculado desde MAINS_FREQ_HZ, usando millis(). Para probar
+  la cadena completa se debe puentear D7 a D2/INT0 con una resistencia serie de
+  1 k a 4.7 k. Esta funcion no es una referencia temporal de precision; solo
+  sirve para validar recepcion de INT0, contador ZC y pulsos de salida D8. No
+  usa librerias bloqueantes, no afecta Timer1 y no debe llamarse desde ISR.
+*/
+void updateSimulatedZeroCrossTask(void)
+{
+#if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
+  uint32_t now = millis();
+
+  if (g_simZeroCrossPulseActive) {
+    if ((int32_t)(now - g_simZeroCrossPulseEndMs) >= 0) {
+      SIM_ZERO_CROSS_PORT &= (uint8_t)~(1 << SIM_ZERO_CROSS_BIT);     // &= ~mascara limpia PD7: termina el pulso simulado.
+      g_simZeroCrossPulseActive = false;
+    }
+  } else {
+    if ((int32_t)(now - g_simZeroCrossNextPulseMs) >= 0) {
+      SIM_ZERO_CROSS_PORT |= (uint8_t)(1 << SIM_ZERO_CROSS_BIT);      // |= OR con mascara: sube D7 y crea flanco para INT0.
+      g_simZeroCrossPulseActive = true;
+      g_simZeroCrossPulseEndMs = now + SIMULATED_ZERO_CROSS_PULSE_MS;
+      g_simZeroCrossNextPulseMs += SIMULATED_ZERO_CROSS_PERIOD_MS;
+
+      if ((int32_t)(now - g_simZeroCrossNextPulseMs) > (int32_t)SIMULATED_ZERO_CROSS_PERIOD_MS) {
+        g_simZeroCrossNextPulseMs = now + SIMULATED_ZERO_CROSS_PERIOD_MS;
+      }
+    }
+  }
+#else
+  SIM_ZERO_CROSS_PORT &= (uint8_t)~(1 << SIM_ZERO_CROSS_BIT);         // Modo deshabilitado: mantiene D7 en bajo si fue usado antes.
+  g_simZeroCrossPulseActive = false;
+#endif
 }
 
 /*
