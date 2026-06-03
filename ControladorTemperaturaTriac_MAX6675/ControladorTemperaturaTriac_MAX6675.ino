@@ -98,9 +98,9 @@
      divisor del pote y conversion de setpoint.
 
   4. Prueba de llave:
-     Con pull-up interno, D4 abierto debe leerse OFF y D4 a GND debe leerse ON.
-     El LCD debe cambiar ON/OFF sin bloquear temperatura ni setpoint. Al pasar a
-     OFF, D8 debe ir inmediatamente a 0 y no deben salir nuevos pulsos.
+     Con el nuevo cableado, D4 a 0 V debe leerse OFF y D4 a 5 V debe leerse ON.
+     El LCD debe cambiar ON/OFF sin bloquear temperatura ni setpoint. Al pasar
+     a OFF, D8 debe ir inmediatamente a 0 y no deben salir nuevos pulsos.
 
   5. Prueba del MAX6675:
      Con termocupla conectada, el LCD debe mostrar T: valor en Celsius. Si
@@ -173,13 +173,20 @@
 #define SIMULATED_ZERO_CROSS_OUTPUT_ENABLE 1   // 1=genera cruce simulado en D7 para puentear a D2; 0=deshabilitado.
 #define SIMULATED_ZERO_CROSS_PULSE_MS  2UL     // Ancho del pulso alto simulado. Con millis(), 1..2 ms es practico.
 
+#define APP_TICK_MS                    10UL
+#define MS_TO_TICKS(ms)                (((ms) + APP_TICK_MS - 1UL) / APP_TICK_MS)
+
 #define CONTROL_INTERVAL_MS            250UL
 #define CONTROL_SAMPLE_TIME_SEC        0.250f
-#define LCD_MAX_INTERVAL_MS            1000UL
+#define LCD_REFRESH_INTERVAL_MS        250UL
+#define LCD_AUTO_PAGE_INTERVAL_MS      3000UL
+#define LCD_NAVIGATION_USE_BUTTON      0       // 0=rotacion automatica, 1=avanza pagina al soltar USER_BUTTON.
+#define LCD_SETPOINT_PREVIEW_HOLD_MS   1000UL
 #define MAX6675_STARTUP_MS             500UL
 
-#define SETPOINT_MIN_C                 50.0f
-#define SETPOINT_MAX_C                 300.0f
+#define SETPOINT_MIN_C                 0.0f
+#define SETPOINT_MAX_C                 240.0f
+#define POT_CHANGE_THRESHOLD_ADC       8U
 
 #define PID_KP                         3.50f
 #define PID_KI                         0.08f
@@ -218,13 +225,22 @@
 #define TRIAC_GATE_PORT                PORTB     // Registro que gobierna el nivel logico del gate.
 #define TRIAC_GATE_BIT                 PB0       // Bit fisico asociado a D8 / PB0.
 
-// Llave digital ON/OFF: D4 / PD4, pull-up interno.
+// Llave digital ON/OFF: D4 / PD4, activa con 5 V. La llave debe entregar
+// 5 V en ON y 0 V en OFF; el pull-up interno queda apagado.
 #define ENABLE_SWITCH_DDR              DDRD      // Direccion de la entrada de llave.
-#define ENABLE_SWITCH_PORT             PORTD     // Pull-up interno de la llave.
+#define ENABLE_SWITCH_PORT             PORTD     // Pull-up de la llave: se deja apagado para permitir 0/5 V reales.
 #define ENABLE_SWITCH_PINREG           PIND      // Lectura directa de la llave.
 #define ENABLE_SWITCH_BIT              PD4       // Bit fisico asociado a D4 / PD4.
-#define ENABLE_SWITCH_ACTIVE_LOW       1
-#define ENABLE_SWITCH_DEBOUNCE_MS      40UL
+#define ENABLE_SWITCH_USE              0         // 0=ignora la llave y muestra DES; 1=usa D4 como habilitacion ON/OFF.
+#define ENABLE_SWITCH_ACTIVE_LOW       0
+#define ENABLE_SWITCH_DEBOUNCE_MS      100UL
+
+// Boton de usuario para navegar pantallas: D3 / PD3, activo con 5 V y pull-down externo.
+#define USER_BUTTON_DDR                DDRD      // Direccion de la entrada del boton.
+#define USER_BUTTON_PORT               PORTD     // En AVR clasico no existe pull-down interno: PORT en 0 deja la entrada sin pull-up.
+#define USER_BUTTON_PINREG             PIND      // Lectura directa del pin del boton.
+#define USER_BUTTON_BIT                PD3       // Bit fisico asociado a D3 / PD3.
+#define USER_BUTTON_DEBOUNCE_MS        100UL
 
 // Potenciometro de setpoint: A0 / PC0 / ADC0.
 #define POT_ADC_CHANNEL                0
@@ -332,7 +348,10 @@ void initADC(void);
 void initLCD(void);
 void initMAX6675(void);
 
+bool updateAppTimeBaseTask(void);
+void updateSetpointPotTask(void);
 float readSetpointPot(void);
+float adcToSetpointC(uint16_t raw);
 uint16_t readADCBlocking(uint8_t channel);
 float readTemperatureMAX6675(void);
 float computePID(float setpointC, float measuredC);
@@ -342,10 +361,13 @@ uint16_t angleToTimerTicks(float angleDeg);
 void updateControlTask(void);
 void updateLCDTask(void);
 void readEnableSwitchTask(void);
+void readUserButtonTask(void);
 void updateSimulatedZeroCrossTask(void);
 void setOutputEnabledAtomic(bool enable);
 bool getOutputEnabledAtomic(void);
 bool readEnableSwitchRawOn(void);
+bool readUserButtonRawPressed(void);
+bool consumeUserButtonReleaseEvent(void);
 
 static inline void setTriacGateHigh(void);
 static inline void setTriacGateLow(void);
@@ -383,15 +405,32 @@ float g_pidIntegralTerm = 0.0f;
 float g_pidLastError = 0.0f;
 bool g_pidHasLastError = false;
 bool g_sensorFault = true;
+bool g_enableSwitchRawOn = false;
 bool g_enableSwitchStableOn = false;
 bool g_enableSwitchLastRawOn = false;
-uint32_t g_enableSwitchLastChangeMs = 0;
-uint32_t g_lastControlMs = 0;
-uint32_t g_lastLCDMs = 0;
-uint32_t g_max6675ReadyMs = MAX6675_STARTUP_MS;
+uint32_t g_enableSwitchLastChangeTick = 0;
+uint32_t g_appTickCount = 0;
+uint32_t g_lastAppTickMs = 0;
+uint32_t g_lastControlTick = 0;
+uint32_t g_lastLCDRefreshTick = 0;
+uint32_t g_lastLCDPageChangeTick = 0;
+uint32_t g_max6675ReadyTick = MS_TO_TICKS(MAX6675_STARTUP_MS);
 uint32_t g_simZeroCrossNextPulseMs = 0;
 uint32_t g_simZeroCrossPulseEndMs = 0;
 bool g_simZeroCrossPulseActive = false;
+uint8_t g_lcdPage = 0;
+uint8_t g_lcdPageBeforeSetpointPreview = 0;
+bool g_lcdForceRefresh = true;
+bool g_lcdSetpointPreviewWasActive = false;
+bool g_userButtonStablePressed = false;
+bool g_userButtonLastRawPressed = false;
+bool g_userButtonPressedFlag = false;
+bool g_userButtonReleaseEvent = false;
+uint32_t g_userButtonLastChangeTick = 0;
+uint16_t g_setpointRaw = 0;
+uint16_t g_setpointPreviewReferenceRaw = 0;
+uint32_t g_setpointPreviewLastMotionTick = 0;
+bool g_setpointPreviewActive = false;
 
 /*
   initVariant()
@@ -425,10 +464,30 @@ void setup(void)
   initMAX6675();
   initExternalInterrupt();
 
-  g_enableSwitchLastRawOn = readEnableSwitchRawOn();
-  g_enableSwitchStableOn = g_enableSwitchLastRawOn;
-  g_simZeroCrossNextPulseMs = millis();
-  g_simZeroCrossPulseEndMs = millis();
+  uint32_t now = millis();
+  g_lastAppTickMs = now;
+  g_appTickCount = 0;
+  g_setpointRaw = readADCBlocking(POT_ADC_CHANNEL);
+  g_setpointPreviewReferenceRaw = g_setpointRaw;
+  g_setpointC = adcToSetpointC(g_setpointRaw);
+#if ENABLE_SWITCH_USE
+  g_enableSwitchRawOn = readEnableSwitchRawOn();
+#else
+  g_enableSwitchRawOn = true;
+#endif
+  g_enableSwitchLastRawOn = g_enableSwitchRawOn;
+  g_enableSwitchStableOn = g_enableSwitchRawOn;
+  g_enableSwitchLastChangeTick = g_appTickCount;
+  g_userButtonLastRawPressed = readUserButtonRawPressed();
+  g_userButtonStablePressed = g_userButtonLastRawPressed;
+  g_userButtonPressedFlag = g_userButtonStablePressed;
+  g_userButtonLastChangeTick = g_appTickCount;
+  g_lastLCDRefreshTick = g_appTickCount;
+  g_lastLCDPageChangeTick = g_appTickCount;
+  g_setpointPreviewLastMotionTick = g_appTickCount;
+  g_lcdForceRefresh = true;
+  g_simZeroCrossNextPulseMs = now;
+  g_simZeroCrossPulseEndMs = now;
   g_simZeroCrossPulseActive = false;
   setOutputEnabledAtomic(false);
 }
@@ -436,16 +495,23 @@ void setup(void)
 /*
   loop()
 
-  Ejecuta una arquitectura cooperativa: debounce de llave en cada pasada,
-  control cada 250 ms y LCD segun umbrales o cada 1 s. Si una lectura del
-  MAX6675 o una transaccion I2C tarda mas de lo esperado, el gate del TRIAC
-  sigue dependiendo de INT0 y Timer1. No debe incluir delay() ni rutinas que
-  deshabiliten interrupciones durante tiempos largos.
+  Ejecuta una arquitectura cooperativa con base de 10 ms para entradas, pote,
+  control y LCD. Si una lectura del MAX6675 o una transaccion I2C tarda mas de
+  lo esperado, el gate del TRIAC sigue dependiendo de INT0 y Timer1. No debe
+  incluir delay() ni rutinas que deshabiliten interrupciones durante tiempos
+  largos.
 */
 void loop(void)
 {
-  readEnableSwitchTask();
   updateSimulatedZeroCrossTask();
+
+  if (!updateAppTimeBaseTask()) {
+    return;
+  }
+
+  readEnableSwitchTask();
+  readUserButtonTask();
+  updateSetpointPotTask();
   updateControlTask();
   updateLCDTask();
 }
@@ -456,10 +522,10 @@ void loop(void)
   Configura directamente DDR y PORT de los pines usados. PB0 queda como salida
   y en bajo para mantener apagado el LED del MOC3053. PD2 queda como entrada de
   cruce por cero, con pull-up opcional segun el detector externo. PD4 queda
-  como entrada con pull-up interno para la llave ON/OFF. PC0 se deja como
-  entrada analogica sin pull-up. Tambien se inicializan los pines sugeridos del
-  MAX6675 para estados electricos seguros. No usa librerias bloqueantes y no
-  debe llamarse desde ISR.
+  como entrada directa 0/5 V para la llave ON/OFF y PD3 como entrada para boton
+  con pull-down externo. PC0 se deja como entrada analogica sin pull-up.
+  Tambien se inicializan los pines sugeridos del MAX6675 para estados
+  electricos seguros. No usa librerias bloqueantes y no debe llamarse desde ISR.
 */
 void initPins(void)
 {
@@ -484,8 +550,10 @@ void initPins(void)
     DDRD/PORTD:
     - PD2 / INT0: entrada de cruce por cero. El pull-up se habilita solo si el
       detector externo lo requiere.
-    - PD4: entrada de llave ON/OFF con pull-up interno. Con el cableado
-      habitual, llave cerrada a GND significa ON.
+    - PD4: entrada de llave ON/OFF directa 0/5 V. Con el cableado sugerido,
+      nivel alto representa ON.
+    - PD3: entrada de boton de usuario con pull-down externo. Nivel alto
+      representa boton presionado.
   */
   ZERO_CROSS_DDR &= (uint8_t)~(1 << ZERO_CROSS_BIT);         // &= ~mascara limpia PD2 en DDRD: INT0 queda como entrada.
 #if ZERO_CROSS_USE_PULLUP
@@ -503,7 +571,10 @@ void initPins(void)
 #endif
 
   ENABLE_SWITCH_DDR &= (uint8_t)~(1 << ENABLE_SWITCH_BIT);   // &= ~mascara limpia PD4 en DDRD: llave como entrada.
-  ENABLE_SWITCH_PORT |= (uint8_t)(1 << ENABLE_SWITCH_BIT);   // |= setea PD4 en PORTD: pull-up interno activo.
+  ENABLE_SWITCH_PORT &= (uint8_t)~(1 << ENABLE_SWITCH_BIT);  // &= ~mascara limpia PD4 en PORTD: pull-up apagado para recibir 0/5 V reales.
+
+  USER_BUTTON_DDR &= (uint8_t)~(1 << USER_BUTTON_BIT);       // &= ~mascara limpia PD3 en DDRD: boton como entrada.
+  USER_BUTTON_PORT &= (uint8_t)~(1 << USER_BUTTON_BIT);      // &= ~mascara limpia PD3 en PORTD: sin pull-up; requiere pull-down externo.
 
   /*
     DDRC/PORTC:
@@ -673,7 +744,61 @@ void initLCD(void)
 */
 void initMAX6675(void)
 {
-  g_max6675ReadyMs = millis() + MAX6675_STARTUP_MS;
+  g_max6675ReadyTick = g_appTickCount + MS_TO_TICKS(MAX6675_STARTUP_MS);
+}
+
+/*
+  updateAppTimeBaseTask()
+
+  Genera la base cooperativa de 10 ms usando millis(). Las tareas de bajo ritmo
+  cuentan ticks desde aqui; solo INT0 y Timer1 quedan para tiempos de precision.
+  Si una tarea bloqueante demora un poco, el contador avanza los ticks
+  transcurridos sin intentar ejecutar tareas atrasadas una por una.
+*/
+bool updateAppTimeBaseTask(void)
+{
+  uint32_t now = millis();
+  uint32_t elapsedMs = now - g_lastAppTickMs;
+
+  if (elapsedMs < APP_TICK_MS) {
+    return false;
+  }
+
+  uint32_t elapsedTicks = elapsedMs / APP_TICK_MS;
+  g_lastAppTickMs += elapsedTicks * APP_TICK_MS;
+  g_appTickCount += elapsedTicks;
+  return true;
+}
+
+/*
+  updateSetpointPotTask()
+
+  Lee el potenciometro en la base de 10 ms, actualiza el setpoint 0..240 C y
+  detecta movimiento suficiente para abrir la pantalla temporal con barra.
+*/
+void updateSetpointPotTask(void)
+{
+  uint16_t raw = readADCBlocking(POT_ADC_CHANNEL);
+  uint16_t delta = (raw > g_setpointPreviewReferenceRaw)
+      ? (raw - g_setpointPreviewReferenceRaw)
+      : (g_setpointPreviewReferenceRaw - raw);
+
+  g_setpointRaw = raw;
+  g_setpointC = adcToSetpointC(raw);
+
+  if (delta < POT_CHANGE_THRESHOLD_ADC) {
+    return;
+  }
+
+  g_setpointPreviewReferenceRaw = raw;
+  g_setpointPreviewLastMotionTick = g_appTickCount;
+
+  if (!g_setpointPreviewActive) {
+    g_lcdPageBeforeSetpointPreview = g_lcdPage;
+    g_setpointPreviewActive = true;
+  }
+
+  g_lcdForceRefresh = true;
 }
 
 /*
@@ -688,6 +813,16 @@ void initMAX6675(void)
 float readSetpointPot(void)
 {
   uint16_t raw = readADCBlocking(POT_ADC_CHANNEL);
+  return adcToSetpointC(raw);
+}
+
+/*
+  adcToSetpointC()
+
+  Convierte una lectura ADC 0..1023 al rango configurable del setpoint.
+*/
+float adcToSetpointC(uint16_t raw)
+{
   float span = SETPOINT_MAX_C - SETPOINT_MIN_C;
   return SETPOINT_MIN_C + ((float)raw * span / 1023.0f);
 }
@@ -723,7 +858,7 @@ uint16_t readADCBlocking(uint8_t channel)
 */
 float readTemperatureMAX6675(void)
 {
-  if ((int32_t)(millis() - g_max6675ReadyMs) < 0) {
+  if ((int32_t)(g_appTickCount - g_max6675ReadyTick) < 0) {
     return NAN;
   }
 
@@ -849,24 +984,23 @@ uint16_t angleToTimerTicks(float angleDeg)
 /*
   updateControlTask()
 
-  Se ejecuta cada CONTROL_INTERVAL_MS. Lee setpoint y temperatura, valida falla
-  de termocupla, calcula el PID, transforma potencia a angulo y publica el
-  retardo de disparo en ticks para las ISR. La publicacion de la variable de 16
-  bits se hace con ATOMIC_BLOCK. En modo final, si el sensor falla, fuerza
-  potencia cero y deshabilita inmediatamente la salida del TRIAC. En
+  Se ejecuta cada CONTROL_INTERVAL_MS usando la base de 10 ms. Toma el setpoint
+  ya muestreado del pote, lee temperatura, valida falla de termocupla, calcula
+  el PID, transforma potencia a angulo y publica el retardo de disparo en ticks
+  para las ISR. La publicacion de la variable de 16 bits se hace con
+  ATOMIC_BLOCK. En modo final, si el sensor falla, fuerza potencia cero y
+  deshabilita inmediatamente la salida del TRIAC. En
   BRINGUP_IO_TEST_MODE, el pote controla una potencia/angulo de prueba y la
   llave permite emitir pulsos aunque la termocupla no este lista, para validar
   D2/D8 con osciloscopio sin conectar potencia. No debe llamarse desde ISR.
 */
 void updateControlTask(void)
 {
-  uint32_t now = millis();
-  if ((uint32_t)(now - g_lastControlMs) < CONTROL_INTERVAL_MS) {
+  if ((uint32_t)(g_appTickCount - g_lastControlTick) < MS_TO_TICKS(CONTROL_INTERVAL_MS)) {
     return;
   }
-  g_lastControlMs = now;
+  g_lastControlTick = g_appTickCount;
 
-  g_setpointC = readSetpointPot();
   float newTemperatureC = readTemperatureMAX6675();
 
   if (isnan(newTemperatureC)) {
@@ -930,29 +1064,18 @@ void updateControlTask(void)
 /*
   updateLCDTask()
 
-  Actualiza el LCD una vez por segundo, sin umbrales de cambio significativo.
-  Usa snprintf() para construir textos del tipo ATRIBUTO:VALOR en buffers
-  estaticos de 16 caracteres. Como el LCD es 16x2, los valores rotan por
-  pantallas: temperatura actual/objetivo, angulo/contador ZC y, si esta
-  habilitado, estado del simulador de cruce. La esquina superior derecha queda
-  reservada para ON/OFF segun la llave debounced D4. Usa LiquidCrystal_I2C, por lo tanto es
-  bloqueante y nunca debe ejecutarse dentro de una ISR.
+  Actualiza el LCD en forma no bloqueante y separa el refresco visual del cambio
+  de pagina. En modo automatico, cada pagina permanece LCD_AUTO_PAGE_INTERVAL_MS
+  antes de pasar a la siguiente. En modo boton, la pagina avanza solo cuando se
+  consume un evento de release debounced del USER_BUTTON. Si el pote se mueve,
+  pausa la rotacion y muestra TEMP OBJ con una barra de 16 columnas hasta que el
+  pote quede quieto durante LCD_SETPOINT_PREVIEW_HOLD_MS. La esquina superior
+  derecha muestra ON/OFF segun la lectura actual 0/5 V de D4. Usa
+  LiquidCrystal_I2C, por lo tanto es bloqueante y nunca debe ejecutarse dentro
+  de una ISR.
 */
 void updateLCDTask(void)
 {
-  uint32_t now = millis();
-  if ((uint32_t)(now - g_lastLCDMs) < LCD_MAX_INTERVAL_MS) {
-    return;
-  }
-  g_lastLCDMs = now;
-
-  bool switchEnabled = g_enableSwitchStableOn;
-  uint32_t zeroCrossCountSnapshot = 0;
-  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
-    zeroCrossCountSnapshot = g_zeroCrossCount;
-  }
-
-  static uint8_t lcdPage = 0;
   const uint8_t lcdPageCount =
 #if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
       3;
@@ -960,15 +1083,73 @@ void updateLCDTask(void)
       2;
 #endif
 
-  if (lcdPage >= lcdPageCount) {
-    lcdPage = 0;
+  if (g_lcdPage >= lcdPageCount) {
+    g_lcdPage = 0;
   }
+
+  if (g_setpointPreviewActive &&
+      (uint32_t)(g_appTickCount - g_setpointPreviewLastMotionTick) >= MS_TO_TICKS(LCD_SETPOINT_PREVIEW_HOLD_MS)) {
+    g_setpointPreviewActive = false;
+    g_lcdPage = g_lcdPageBeforeSetpointPreview;
+    if (g_lcdPage >= lcdPageCount) {
+      g_lcdPage = 0;
+    }
+    g_lastLCDPageChangeTick = g_appTickCount;
+    g_lcdForceRefresh = true;
+  }
+
+#if LCD_NAVIGATION_USE_BUTTON
+  if (g_setpointPreviewActive) {
+    (void)consumeUserButtonReleaseEvent();
+  }
+#endif
+
+  if (!g_setpointPreviewActive) {
+#if LCD_NAVIGATION_USE_BUTTON
+    if (consumeUserButtonReleaseEvent()) {
+      g_lcdPage++;
+      if (g_lcdPage >= lcdPageCount) {
+        g_lcdPage = 0;
+      }
+      g_lcdForceRefresh = true;
+    }
+#else
+    if ((uint32_t)(g_appTickCount - g_lastLCDPageChangeTick) >= MS_TO_TICKS(LCD_AUTO_PAGE_INTERVAL_MS)) {
+      g_lastLCDPageChangeTick = g_appTickCount;
+      g_lcdPage++;
+      if (g_lcdPage >= lcdPageCount) {
+        g_lcdPage = 0;
+      }
+      g_lcdForceRefresh = true;
+    }
+#endif
+  }
+
+  if (!g_lcdForceRefresh &&
+      (uint32_t)(g_appTickCount - g_lastLCDRefreshTick) < MS_TO_TICKS(LCD_REFRESH_INTERVAL_MS)) {
+    return;
+  }
+
+  g_lastLCDRefreshTick = g_appTickCount;
+  g_lcdForceRefresh = false;
 
   char topAttribute[14];
   char bottomAttribute[17];
   char topLine[17];
   char bottomLine[17];
-  const char *stateText = switchEnabled ? "ON " : "OFF";
+  bool switchEnabled = g_enableSwitchStableOn;
+  const char *stateText =
+#if ENABLE_SWITCH_USE
+      switchEnabled ? "ON " : "OFF";
+#else
+      "DES";
+#endif
+  bool showStateText = !g_setpointPreviewActive;
+
+  if (g_setpointPreviewActive && !g_lcdSetpointPreviewWasActive) {
+    lcd.clear();
+  }
+  g_lcdSetpointPreviewWasActive = g_setpointPreviewActive;
 
   int tempActualInt = 0;
   if (!g_sensorFault && !isnan(g_temperatureC)) {
@@ -977,70 +1158,108 @@ void updateLCDTask(void)
 
   int tempObjetivoInt = (int)(g_setpointC + 0.5f);
   int angleDisplay = (int)(g_angleDeg + 0.5f);
+  uint32_t zeroCrossCountSnapshot = 0;
+  ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+    zeroCrossCountSnapshot = g_zeroCrossCount;
+  }
   uint16_t zeroCrossDisplay = (uint16_t)(zeroCrossCountSnapshot % 10000UL);
 
-  switch (lcdPage) {
-    case 0:
-      if (g_sensorFault || isnan(g_temperatureC)) {
-        snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT: ERR");
-      } else {
-        snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT:%4d", tempActualInt);
-      }
-      snprintf(bottomAttribute, sizeof(bottomAttribute), "TEMP OBJ:%4d", tempObjetivoInt);
-      break;
+  if (g_setpointPreviewActive) {
+    float barStepC = (SETPOINT_MAX_C - SETPOINT_MIN_C) / (float)LCD_COLUMNS;
+    uint8_t filledColumns = 0;
 
-    case 1:
-      snprintf(topAttribute, sizeof(topAttribute), "ANG DISP:%4d", angleDisplay);
-      snprintf(bottomAttribute, sizeof(bottomAttribute), "ZC CNT:%5u", zeroCrossDisplay);
-      break;
+    if (barStepC > 0.0f && g_setpointC > SETPOINT_MIN_C) {
+      filledColumns = (uint8_t)((g_setpointC - SETPOINT_MIN_C + barStepC - 0.001f) / barStepC);
+    }
 
-    default:
+    if (filledColumns > LCD_COLUMNS) {
+      filledColumns = LCD_COLUMNS;
+    }
+
+    snprintf(topAttribute, sizeof(topAttribute), "TEMP OBJ:%4d", tempObjetivoInt);
+
+    for (uint8_t column = 0; column < LCD_COLUMNS; column++) {
+      bottomLine[column] = (column < filledColumns) ? (char)255 : ' ';
+    }
+    bottomLine[LCD_COLUMNS] = '\0';
+  } else {
+    switch (g_lcdPage) {
+      case 0:
+        if (g_sensorFault || isnan(g_temperatureC)) {
+          snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT: ERR");
+        } else {
+          snprintf(topAttribute, sizeof(topAttribute), "TEMP ACT:%4d", tempActualInt);
+        }
+        snprintf(bottomAttribute, sizeof(bottomAttribute), "TEMP OBJ:%4d", tempObjetivoInt);
+        break;
+
+      case 1:
+        snprintf(topAttribute, sizeof(topAttribute), "ANG DISP:%4d", angleDisplay);
+        snprintf(bottomAttribute, sizeof(bottomAttribute), "ZC CNT:%5u", zeroCrossDisplay);
+        break;
+
+      default:
 #if SIMULATED_ZERO_CROSS_OUTPUT_ENABLE
-      snprintf(topAttribute, sizeof(topAttribute), "SIM ZC: ON");
-      snprintf(bottomAttribute, sizeof(bottomAttribute), "PER:%2lums W:%lums",
-               (unsigned long)SIMULATED_ZERO_CROSS_PERIOD_MS,
-               (unsigned long)SIMULATED_ZERO_CROSS_PULSE_MS);
+        snprintf(topAttribute, sizeof(topAttribute), "SIM ZC: ON");
+        snprintf(bottomAttribute, sizeof(bottomAttribute), "PER:%2lums W:%lums",
+                 (unsigned long)SIMULATED_ZERO_CROSS_PERIOD_MS,
+                 (unsigned long)SIMULATED_ZERO_CROSS_PULSE_MS);
 #else
-      snprintf(topAttribute, sizeof(topAttribute), "SIM ZC:OFF");
-      snprintf(bottomAttribute, sizeof(bottomAttribute), "PUENTE:NO");
+        snprintf(topAttribute, sizeof(topAttribute), "SIM ZC:OFF");
+        snprintf(bottomAttribute, sizeof(bottomAttribute), "PUENTE:NO");
 #endif
-      break;
+        break;
+    }
+
+    snprintf(bottomLine, sizeof(bottomLine), "%-16.16s", bottomAttribute);
   }
 
-  snprintf(topLine, sizeof(topLine), "%-13.13s%s", topAttribute, stateText);
-  snprintf(bottomLine, sizeof(bottomLine), "%-16.16s", bottomAttribute);
+  if (showStateText) {
+    snprintf(topLine, sizeof(topLine), "%-13.13s%s", topAttribute, stateText);
+  } else {
+    snprintf(topLine, sizeof(topLine), "%-16.16s", topAttribute);
+  }
 
   lcd.setCursor(0, 0);
   lcd.print(topLine);
   lcd.setCursor(0, 1);
   lcd.print(bottomLine);
-
-  lcdPage++;
-  if (lcdPage >= lcdPageCount) {
-    lcdPage = 0;
-  }
 }
 
 /*
   readEnableSwitchTask()
 
-  Lee la llave ON/OFF con debounce por software no bloqueante. La entrada tiene
-  pull-up interno y, por defecto, nivel bajo significa ON. Si el estado estable
-  pasa a OFF, corta inmediatamente el gate del MOC3053 y deshabilita las
-  comparaciones de Timer1 de forma atomica. No detiene el sensor ni el LCD. No
-  debe llamarse desde ISR.
+  Lee la llave ON/OFF con debounce por software no bloqueante cuando
+  ENABLE_SWITCH_USE esta activo. Si ENABLE_SWITCH_USE vale 0, fuerza el permiso
+  de salida a habilitado y el LCD muestra DES. Con la llave activa, 5 V
+  significa ON y 0 V significa OFF; al pasar a OFF corta inmediatamente el gate
+  del MOC3053 y deshabilita las comparaciones de Timer1 de forma atomica.
 */
 void readEnableSwitchTask(void)
 {
-  uint32_t now = millis();
+#if !ENABLE_SWITCH_USE
+  if (!g_enableSwitchStableOn || !g_enableSwitchRawOn) {
+    g_enableSwitchRawOn = true;
+    g_enableSwitchStableOn = true;
+    g_enableSwitchLastRawOn = true;
+    g_lcdForceRefresh = true;
+  }
+  return;
+#endif
+
   bool rawOn = readEnableSwitchRawOn();
+
+  if (rawOn != g_enableSwitchRawOn) {
+    g_enableSwitchRawOn = rawOn;
+    g_lcdForceRefresh = true;
+  }
 
   if (rawOn != g_enableSwitchLastRawOn) {
     g_enableSwitchLastRawOn = rawOn;
-    g_enableSwitchLastChangeMs = now;
+    g_enableSwitchLastChangeTick = g_appTickCount;
   }
 
-  if ((uint32_t)(now - g_enableSwitchLastChangeMs) >= ENABLE_SWITCH_DEBOUNCE_MS) {
+  if ((uint32_t)(g_appTickCount - g_enableSwitchLastChangeTick) >= MS_TO_TICKS(ENABLE_SWITCH_DEBOUNCE_MS)) {
     if (rawOn != g_enableSwitchStableOn) {
       g_enableSwitchStableOn = rawOn;
 
@@ -1055,6 +1274,64 @@ void readEnableSwitchTask(void)
       }
     }
   }
+}
+
+/*
+  readUserButtonTask()
+
+  Lee un boton de usuario activo en alto con debounce no bloqueante basado en
+  la base cooperativa de 10 ms. Cuando detecta una presion estable, eleva
+  g_userButtonPressedFlag.
+  Cuando detecta la suelta estable despues de haber estado presionado, limpia
+  esa bandera y publica un unico evento g_userButtonReleaseEvent consumible.
+  Asi la accion asociada se dispara solo al soltar y no se repite mientras se
+  mantiene el boton apretado. No debe llamarse desde ISR.
+*/
+void readUserButtonTask(void)
+{
+  bool rawPressed = readUserButtonRawPressed();
+
+  if (rawPressed != g_userButtonLastRawPressed) {
+    g_userButtonLastRawPressed = rawPressed;
+    g_userButtonLastChangeTick = g_appTickCount;
+  }
+
+  if ((uint32_t)(g_appTickCount - g_userButtonLastChangeTick) < MS_TO_TICKS(USER_BUTTON_DEBOUNCE_MS)) {
+    return;
+  }
+
+  if (rawPressed == g_userButtonStablePressed) {
+    return;
+  }
+
+  g_userButtonStablePressed = rawPressed;
+
+  if (g_userButtonStablePressed) {
+    g_userButtonPressedFlag = true;
+    return;
+  }
+
+  if (g_userButtonPressedFlag) {
+    g_userButtonPressedFlag = false;
+    g_userButtonReleaseEvent = true;
+  }
+}
+
+/*
+  consumeUserButtonReleaseEvent()
+
+  Devuelve true una sola vez por cada secuencia presionar-soltar valida del
+  boton de usuario. Leerlo consume el evento para evitar multiples avances de
+  pagina con una misma pulsacion. No debe llamarse desde ISR.
+*/
+bool consumeUserButtonReleaseEvent(void)
+{
+  if (!g_userButtonReleaseEvent) {
+    return false;
+  }
+
+  g_userButtonReleaseEvent = false;
+  return true;
 }
 
 /*
@@ -1141,9 +1418,9 @@ bool getOutputEnabledAtomic(void)
   readEnableSwitchRawOn()
 
   Lee directamente PIND para interpretar la llave digital sin librerias. Con
-  ENABLE_SWITCH_ACTIVE_LOW en 1, la llave conectada a GND representa ON gracias
-  al pull-up interno. Esta lectura no es bloqueante, no toca temporizacion
-  critica y puede llamarse en loop. No es necesario llamarla desde ISR.
+  ENABLE_SWITCH_ACTIVE_LOW en 0, 5 V en D4 representa ON y 0 V representa OFF.
+  Esta lectura no es bloqueante, no toca temporizacion critica y puede llamarse
+  en loop. No es necesario llamarla desde ISR.
 */
 bool readEnableSwitchRawOn(void)
 {
@@ -1154,6 +1431,18 @@ bool readEnableSwitchRawOn(void)
 #else
   return pinIsHigh;
 #endif
+}
+
+/*
+  readUserButtonRawPressed()
+
+  Lee directamente PIND para interpretar el boton de usuario. Esta version
+  asume hardware con pull-down externo: 0 V en reposo y 5 V mientras el boton
+  esta presionado. No es bloqueante y se usa solo desde loop.
+*/
+bool readUserButtonRawPressed(void)
+{
+  return (USER_BUTTON_PINREG & (uint8_t)(1 << USER_BUTTON_BIT)) != 0;
 }
 
 /*
